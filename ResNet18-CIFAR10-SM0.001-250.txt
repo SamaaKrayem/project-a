@@ -1,0 +1,1428 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import warnings
+from typing import Optional, Tuple
+
+import torch
+from torch import Tensor
+from torch.nn.init import constant_, xavier_normal_, xavier_uniform_
+from torch.nn.parameter import Parameter
+import torch.autograd
+from torch import autograd
+
+sm_alpha=0.001
+
+def SMrelu_forward(z: Tensor, alpha: float):
+    relu_positive = z
+    relu_zero = 0
+    relu_output = torch.where(z>0, relu_positive, relu_zero)
+    return relu_output
+  
+
+class SMRELUFunction(torch.autograd.Function):
+    
+    @staticmethod
+    def forward(ctx, z: Tensor, alpha: float):
+        relu = SMrelu_forward(z, alpha) # Regular forward pass computation from before
+        ctx.save_for_backward(z)    # Tensors should be saved using this method
+        ctx.alpha = alpha           # other properties can be saved like so
+        return relu
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        z, = ctx.saved_tensors      # Validates that no in-place modifications happened on saved tensors
+        alpha = ctx.alpha
+        
+        # Calculate diagonal of d(elu(z))/dz
+        grad_positive = torch.ones_like(z)
+        grad_zero = 0
+        
+        # Note: This is not the full Jacobian, d(elu(z))/dz, it's the diagonal
+        grad_SMrelu = torch.where(z > ((-1)*alpha), grad_positive, grad_zero)
+        
+        # Gradient of the loss w.r.t. our output
+        δ_smrelu = grad_output
+        
+        # Calcualte δz = d(elu(z))/dz * δ_elu
+        # Note: elementwise multiplication equivalant to vector-Jacobian product
+        δz = grad_SMrelu * δ_smrelu
+        return δz, None
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion*planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion*planes,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion*planes)
+            )
+
+    def forward(self, x):
+        out = SMRELUFunction.apply(self.bn1(self.conv1(x)),sm_alpha)
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = SMRELUFunction.apply(out,sm_alpha)
+        return out
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, self.expansion *
+                               planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(self.expansion*planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion*planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion*planes,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion*planes)
+            )
+
+    def forward(self, x):
+        out = SMRELUFunction.apply(self.bn1(self.conv1(x)),sm_alpha)
+        out = SMRELUFunction.apply(self.bn2(self.conv2(out)),sm_alpha)
+        out = self.bn3(self.conv3(out))
+        out += self.shortcut(x)
+        out = SMRELUFunction.apply(out,sm_alpha)
+        return out
+
+class ResNet(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=10):
+        super(ResNet, self).__init__()
+        self.in_planes = 64
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
+        self.linear = nn.Linear(512*block.expansion, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = SMRELUFunction.apply(self.bn1(self.conv1(x)),sm_alpha)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+def ResNet18():
+    return ResNet(BasicBlock, [2, 2, 2, 2])
+
+
+def ResNet34():
+    return ResNet(BasicBlock, [3, 4, 6, 3])
+
+
+def ResNet50():
+    return ResNet(Bottleneck, [3, 4, 6, 3])
+
+
+def ResNet101():
+    return ResNet(Bottleneck, [3, 4, 23, 3])
+
+
+def ResNet152():
+    return ResNet(Bottleneck, [3, 8, 36, 3])
+
+
+def test():
+    net = ResNet18()
+    y = net(torch.randn(1, 3, 32, 32))
+    print(y.size())
+
+import time
+import os
+import sys
+import shutil
+
+TOTAL_BAR_LENGTH=65
+_, term_width = shutil.get_terminal_size()
+term_width = int(term_width)
+last_time = time.time()
+begin_time = last_time
+
+def format_time(seconds):
+    days = int(seconds / 3600/24)
+    seconds = seconds - days*3600*24
+    hours = int(seconds / 3600)
+    seconds = seconds - hours*3600
+    minutes = int(seconds / 60)
+    seconds = seconds - minutes*60
+    secondsf = int(seconds)
+    seconds = seconds - secondsf
+    millis = int(seconds*1000)
+
+    f = ''
+    i = 1
+    if days > 0:
+        f += str(days) + 'D'
+        i += 1
+    if hours > 0 and i <= 2:
+        f += str(hours) + 'h'
+        i += 1
+    if minutes > 0 and i <= 2:
+        f += str(minutes) + 'm'
+        i += 1
+    if secondsf > 0 and i <= 2:
+        f += str(secondsf) + 's'
+        i += 1
+    if millis > 0 and i <= 2:
+        f += str(millis) + 'ms'
+        i += 1
+    if f == '':
+        f = '0ms'
+    return f
+
+def progress_bar(current, total, msg=None):
+    global last_time, begin_time
+    if current == 0:
+        begin_time = time.time()  # Reset for new bar.
+
+    cur_len = int(TOTAL_BAR_LENGTH*current/total)
+    rest_len = int(TOTAL_BAR_LENGTH - cur_len) - 1
+
+    sys.stdout.write(' [')
+    for i in range(cur_len):
+        sys.stdout.write('=')
+    sys.stdout.write('>')
+    for i in range(rest_len):
+        sys.stdout.write('.')
+    sys.stdout.write(']')
+
+    cur_time = time.time()
+    step_time = cur_time - last_time
+    last_time = cur_time
+    tot_time = cur_time - begin_time
+
+    L = []
+    L.append('  Step: %s' % format_time(step_time))
+    L.append(' | Tot: %s' % format_time(tot_time))
+    if msg:
+        L.append(' | ' + msg)
+
+    msg = ''.join(L)
+    sys.stdout.write(msg)
+    for i in range(term_width-int(TOTAL_BAR_LENGTH)-len(msg)-3):
+        sys.stdout.write(' ')
+
+    # Go back to the center of the bar.
+    for i in range(term_width-int(TOTAL_BAR_LENGTH/2)+2):
+        sys.stdout.write('\b')
+    sys.stdout.write(' %d/%d ' % (current+1, total))
+
+    if current < total-1:
+        sys.stdout.write('\r')
+    else:
+        sys.stdout.write('\n')
+    sys.stdout.flush()
+
+import torch.optim as optim
+import torch.backends.cudnn as cudnn
+
+import torchvision
+import torchvision.transforms as transforms
+
+import argparse
+
+parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
+parser.add_argument('-f')
+parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
+parser.add_argument('--resume', '-r', action='store_true',
+                    help='resume from checkpoint')
+args = parser.parse_args()
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+best_acc = 0  # best test accuracy
+start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+
+# Data
+print('==> Preparing data..')
+transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
+
+transform_test = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
+
+trainset = torchvision.datasets.CIFAR10(
+    root='./data', train=True, download=True, transform=transform_train)
+trainloader = torch.utils.data.DataLoader(
+    trainset, batch_size=128, shuffle=True, num_workers=2)
+
+testset = torchvision.datasets.CIFAR10(
+    root='./data', train=False, download=True, transform=transform_test)
+testloader = torch.utils.data.DataLoader(
+    testset, batch_size=100, shuffle=False, num_workers=2)
+
+classes = ('plane', 'car', 'bird', 'cat', 'deer',
+           'dog', 'frog', 'horse', 'ship', 'truck')
+
+print('==> Building model..')
+net = ResNet18()
+
+net = net.to(device)
+if device == 'cuda':
+    net = torch.nn.DataParallel(net)
+    cudnn.benchmark = True
+
+if args.resume:
+    # Load checkpoint.
+    print('==> Resuming from checkpoint..')
+    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
+    checkpoint = torch.load('./checkpoint/ckpt.pth')
+    net.load_state_dict(checkpoint['net'])
+    best_acc = checkpoint['acc']
+    start_epoch = checkpoint['epoch']
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(net.parameters(), lr=args.lr,
+                      momentum=0.9, weight_decay=5e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+
+# Training
+def train(epoch):
+    print('\nEpoch: %d' % epoch)
+    net.train()
+    train_loss = 0
+    correct = 0
+    total = 0
+    for batch_idx, (inputs, targets) in enumerate(trainloader):
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = net(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+
+        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+
+
+def test(epoch):
+    global best_acc
+    net.eval()
+    test_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(testloader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = net(inputs)
+            loss = criterion(outputs, targets)
+
+            test_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+            progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                         % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
+
+    # Save checkpoint.
+    acc = 100.*correct/total
+    if acc > best_acc:
+        print('Saving..')
+        state = {
+            'net': net.state_dict(),
+            'acc': acc,
+            'epoch': epoch,
+        }
+        if not os.path.isdir('checkpoint'):
+            os.mkdir('checkpoint')
+        torch.save(state, './checkpoint/ckpt.pth')
+        best_acc = acc
+
+
+for epoch in range(start_epoch, start_epoch+250):
+    train(epoch)
+    test(epoch)
+    scheduler.step()
+
+Epoch: 0
+ [================================================================>]  Step: 584ms | Tot: 46s862ms | Loss: 1.748 | Acc: 36.110% (18055/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s752ms | Loss: 1.504 | Acc: 45.240% (4524/10000) 100/100 
+Saving..
+
+Epoch: 1
+ [================================================================>]  Step: 82ms | Tot: 46s164ms | Loss: 1.257 | Acc: 54.194% (27097/50000) 391/391 
+ [================================================================>]  Step: 143ms | Tot: 4s65ms | Loss: 1.108 | Acc: 60.900% (6090/10000) 100/100 
+Saving..
+
+Epoch: 2
+ [================================================================>]  Step: 70ms | Tot: 46s234ms | Loss: 0.992 | Acc: 64.768% (32384/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s293ms | Loss: 1.147 | Acc: 62.250% (6225/10000) 100/100 
+Saving..
+
+Epoch: 3
+ [================================================================>]  Step: 79ms | Tot: 46s206ms | Loss: 0.810 | Acc: 71.744% (35872/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s232ms | Loss: 1.024 | Acc: 65.660% (6566/10000) 100/100 
+Saving..
+
+Epoch: 4
+ [================================================================>]  Step: 79ms | Tot: 46s551ms | Loss: 0.685 | Acc: 76.130% (38065/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s15ms | Loss: 0.870 | Acc: 70.980% (7098/10000) 100/100 
+Saving..
+
+Epoch: 5
+ [================================================================>]  Step: 70ms | Tot: 46s207ms | Loss: 0.607 | Acc: 79.044% (39522/50000) 391/391 
+ [================================================================>]  Step: 28ms | Tot: 4s212ms | Loss: 0.675 | Acc: 76.950% (7695/10000) 100/100 
+Saving..
+
+Epoch: 6
+ [================================================================>]  Step: 78ms | Tot: 46s334ms | Loss: 0.558 | Acc: 80.836% (40418/50000) 391/391 
+ [================================================================>]  Step: 30ms | Tot: 4s134ms | Loss: 0.686 | Acc: 77.060% (7706/10000) 100/100 
+Saving..
+
+Epoch: 7
+ [================================================================>]  Step: 83ms | Tot: 46s149ms | Loss: 0.526 | Acc: 81.962% (40981/50000) 391/391 
+ [================================================================>]  Step: 33ms | Tot: 4s108ms | Loss: 0.639 | Acc: 78.340% (7834/10000) 100/100 
+Saving..
+
+Epoch: 8
+ [================================================================>]  Step: 76ms | Tot: 46s537ms | Loss: 0.504 | Acc: 82.550% (41275/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 5s65ms | Loss: 0.566 | Acc: 80.990% (8099/10000) 100/100 
+Saving..
+
+Epoch: 9
+ [================================================================>]  Step: 73ms | Tot: 46s390ms | Loss: 0.487 | Acc: 83.284% (41642/50000) 391/391 
+ [================================================================>]  Step: 53ms | Tot: 4s245ms | Loss: 0.727 | Acc: 77.090% (7709/10000) 100/100 
+
+Epoch: 10
+ [================================================================>]  Step: 78ms | Tot: 45s981ms | Loss: 0.465 | Acc: 84.010% (42005/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 5s87ms | Loss: 0.498 | Acc: 83.050% (8305/10000) 100/100 
+Saving..
+
+Epoch: 11
+ [================================================================>]  Step: 84ms | Tot: 46s29ms | Loss: 0.452 | Acc: 84.510% (42255/50000) 391/391 
+ [================================================================>]  Step: 49ms | Tot: 4s252ms | Loss: 1.053 | Acc: 70.630% (7063/10000) 100/100 
+
+Epoch: 12
+ [================================================================>]  Step: 80ms | Tot: 46s140ms | Loss: 0.439 | Acc: 84.916% (42458/50000) 391/391 
+ [================================================================>]  Step: 28ms | Tot: 4s15ms | Loss: 0.859 | Acc: 73.240% (7324/10000) 100/100 
+
+Epoch: 13
+ [================================================================>]  Step: 80ms | Tot: 46s525ms | Loss: 0.427 | Acc: 85.418% (42709/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s161ms | Loss: 0.631 | Acc: 79.610% (7961/10000) 100/100 
+
+Epoch: 14
+ [================================================================>]  Step: 82ms | Tot: 46s316ms | Loss: 0.425 | Acc: 85.378% (42689/50000) 391/391 
+ [================================================================>]  Step: 29ms | Tot: 4s184ms | Loss: 0.690 | Acc: 77.520% (7752/10000) 100/100 
+
+Epoch: 15
+ [================================================================>]  Step: 84ms | Tot: 46s479ms | Loss: 0.406 | Acc: 86.014% (43007/50000) 391/391 
+ [================================================================>]  Step: 53ms | Tot: 4s151ms | Loss: 0.559 | Acc: 81.530% (8153/10000) 100/100 
+
+Epoch: 16
+ [================================================================>]  Step: 78ms | Tot: 46s295ms | Loss: 0.398 | Acc: 86.390% (43195/50000) 391/391 
+ [================================================================>]  Step: 43ms | Tot: 4s218ms | Loss: 0.558 | Acc: 81.490% (8149/10000) 100/100 
+
+Epoch: 17
+ [================================================================>]  Step: 70ms | Tot: 46s535ms | Loss: 0.391 | Acc: 86.724% (43362/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s165ms | Loss: 0.883 | Acc: 75.210% (7521/10000) 100/100 
+
+Epoch: 18
+ [================================================================>]  Step: 73ms | Tot: 46s28ms | Loss: 0.391 | Acc: 86.648% (43324/50000) 391/391 
+ [================================================================>]  Step: 49ms | Tot: 4s121ms | Loss: 0.597 | Acc: 80.920% (8092/10000) 100/100 
+
+Epoch: 19
+ [================================================================>]  Step: 76ms | Tot: 46s115ms | Loss: 0.382 | Acc: 87.006% (43503/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s148ms | Loss: 0.579 | Acc: 80.890% (8089/10000) 100/100 
+
+Epoch: 20
+ [================================================================>]  Step: 80ms | Tot: 46s193ms | Loss: 0.382 | Acc: 86.876% (43438/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s236ms | Loss: 0.501 | Acc: 83.070% (8307/10000) 100/100 
+Saving..
+
+Epoch: 21
+ [================================================================>]  Step: 76ms | Tot: 45s804ms | Loss: 0.376 | Acc: 87.114% (43557/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 5s78ms | Loss: 0.479 | Acc: 84.080% (8408/10000) 100/100 
+Saving..
+
+Epoch: 22
+ [================================================================>]  Step: 69ms | Tot: 46s40ms | Loss: 0.372 | Acc: 87.292% (43646/50000) 391/391 
+ [================================================================>]  Step: 52ms | Tot: 4s45ms | Loss: 0.466 | Acc: 84.760% (8476/10000) 100/100 
+Saving..
+
+Epoch: 23
+ [================================================================>]  Step: 81ms | Tot: 46s111ms | Loss: 0.362 | Acc: 87.624% (43812/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s314ms | Loss: 0.455 | Acc: 85.050% (8505/10000) 100/100 
+Saving..
+
+Epoch: 24
+ [================================================================>]  Step: 82ms | Tot: 46s205ms | Loss: 0.360 | Acc: 87.666% (43833/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s171ms | Loss: 0.585 | Acc: 81.050% (8105/10000) 100/100 
+
+Epoch: 25
+ [================================================================>]  Step: 82ms | Tot: 46s457ms | Loss: 0.359 | Acc: 87.632% (43816/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s325ms | Loss: 0.570 | Acc: 81.280% (8128/10000) 100/100 
+
+Epoch: 26
+ [================================================================>]  Step: 80ms | Tot: 46s583ms | Loss: 0.352 | Acc: 88.084% (44042/50000) 391/391 
+ [================================================================>]  Step: 49ms | Tot: 4s116ms | Loss: 0.546 | Acc: 82.180% (8218/10000) 100/100 
+
+Epoch: 27
+ [================================================================>]  Step: 74ms | Tot: 46s263ms | Loss: 0.347 | Acc: 88.190% (44095/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s106ms | Loss: 0.685 | Acc: 78.220% (7822/10000) 100/100 
+
+Epoch: 28
+ [================================================================>]  Step: 69ms | Tot: 45s972ms | Loss: 0.350 | Acc: 88.144% (44072/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s85ms | Loss: 0.463 | Acc: 84.260% (8426/10000) 100/100 
+
+Epoch: 29
+ [================================================================>]  Step: 79ms | Tot: 46s93ms | Loss: 0.343 | Acc: 88.538% (44269/50000) 391/391 
+ [================================================================>]  Step: 49ms | Tot: 4s161ms | Loss: 0.515 | Acc: 82.850% (8285/10000) 100/100 
+
+Epoch: 30
+ [================================================================>]  Step: 83ms | Tot: 46s338ms | Loss: 0.343 | Acc: 88.360% (44180/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s183ms | Loss: 0.491 | Acc: 83.380% (8338/10000) 100/100 
+
+Epoch: 31
+ [================================================================>]  Step: 85ms | Tot: 45s979ms | Loss: 0.339 | Acc: 88.298% (44149/50000) 391/391 
+ [================================================================>]  Step: 80ms | Tot: 4s40ms | Loss: 0.539 | Acc: 81.970% (8197/10000) 100/100 
+
+Epoch: 32
+ [================================================================>]  Step: 86ms | Tot: 45s776ms | Loss: 0.336 | Acc: 88.474% (44237/50000) 391/391 
+ [================================================================>]  Step: 26ms | Tot: 4s790ms | Loss: 0.403 | Acc: 86.870% (8687/10000) 100/100 
+Saving..
+
+Epoch: 33
+ [================================================================>]  Step: 81ms | Tot: 45s677ms | Loss: 0.332 | Acc: 88.706% (44353/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s153ms | Loss: 0.592 | Acc: 80.470% (8047/10000) 100/100 
+
+Epoch: 34
+ [================================================================>]  Step: 72ms | Tot: 46s198ms | Loss: 0.328 | Acc: 89.006% (44503/50000) 391/391 
+ [================================================================>]  Step: 47ms | Tot: 4s255ms | Loss: 0.398 | Acc: 86.280% (8628/10000) 100/100 
+
+Epoch: 35
+ [================================================================>]  Step: 85ms | Tot: 46s279ms | Loss: 0.327 | Acc: 88.904% (44452/50000) 391/391 
+ [================================================================>]  Step: 31ms | Tot: 4s205ms | Loss: 0.507 | Acc: 84.030% (8403/10000) 100/100 
+
+Epoch: 36
+ [================================================================>]  Step: 73ms | Tot: 46s221ms | Loss: 0.326 | Acc: 88.836% (44418/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s211ms | Loss: 0.517 | Acc: 82.620% (8262/10000) 100/100 
+
+Epoch: 37
+ [================================================================>]  Step: 84ms | Tot: 46s200ms | Loss: 0.322 | Acc: 89.142% (44571/50000) 391/391 
+ [================================================================>]  Step: 31ms | Tot: 4s200ms | Loss: 0.709 | Acc: 78.250% (7825/10000) 100/100 
+
+Epoch: 38
+ [================================================================>]  Step: 79ms | Tot: 46s169ms | Loss: 0.326 | Acc: 88.820% (44410/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s211ms | Loss: 0.514 | Acc: 83.110% (8311/10000) 100/100 
+
+Epoch: 39
+ [================================================================>]  Step: 80ms | Tot: 46s284ms | Loss: 0.324 | Acc: 88.812% (44406/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s320ms | Loss: 0.500 | Acc: 83.910% (8391/10000) 100/100 
+
+Epoch: 40
+ [================================================================>]  Step: 83ms | Tot: 46s422ms | Loss: 0.321 | Acc: 89.162% (44581/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s65ms | Loss: 0.578 | Acc: 82.390% (8239/10000) 100/100 
+
+Epoch: 41
+ [================================================================>]  Step: 90ms | Tot: 46s227ms | Loss: 0.311 | Acc: 89.414% (44707/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s211ms | Loss: 0.441 | Acc: 85.460% (8546/10000) 100/100 
+
+Epoch: 42
+ [================================================================>]  Step: 79ms | Tot: 46s17ms | Loss: 0.313 | Acc: 89.242% (44621/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s938ms | Loss: 0.451 | Acc: 84.860% (8486/10000) 100/100 
+
+Epoch: 43
+ [================================================================>]  Step: 77ms | Tot: 46s410ms | Loss: 0.313 | Acc: 89.278% (44639/50000) 391/391 
+ [================================================================>]  Step: 51ms | Tot: 4s115ms | Loss: 0.596 | Acc: 81.630% (8163/10000) 100/100 
+
+Epoch: 44
+ [================================================================>]  Step: 81ms | Tot: 46s269ms | Loss: 0.316 | Acc: 89.244% (44622/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s200ms | Loss: 0.485 | Acc: 84.400% (8440/10000) 100/100 
+
+Epoch: 45
+ [================================================================>]  Step: 73ms | Tot: 45s982ms | Loss: 0.305 | Acc: 89.740% (44870/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s222ms | Loss: 0.453 | Acc: 84.700% (8470/10000) 100/100 
+
+Epoch: 46
+ [================================================================>]  Step: 75ms | Tot: 46s163ms | Loss: 0.305 | Acc: 89.498% (44749/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s142ms | Loss: 0.416 | Acc: 85.700% (8570/10000) 100/100 
+
+Epoch: 47
+ [================================================================>]  Step: 76ms | Tot: 46s306ms | Loss: 0.301 | Acc: 89.750% (44875/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s33ms | Loss: 0.499 | Acc: 84.380% (8438/10000) 100/100 
+
+Epoch: 48
+ [================================================================>]  Step: 84ms | Tot: 46s323ms | Loss: 0.304 | Acc: 89.564% (44782/50000) 391/391 
+ [================================================================>]  Step: 30ms | Tot: 4s131ms | Loss: 0.417 | Acc: 86.490% (8649/10000) 100/100 
+
+Epoch: 49
+ [================================================================>]  Step: 80ms | Tot: 46s166ms | Loss: 0.300 | Acc: 89.706% (44853/50000) 391/391 
+ [================================================================>]  Step: 43ms | Tot: 4s271ms | Loss: 0.375 | Acc: 86.830% (8683/10000) 100/100 
+
+Epoch: 50
+ [================================================================>]  Step: 75ms | Tot: 46s90ms | Loss: 0.302 | Acc: 89.792% (44896/50000) 391/391 
+ [================================================================>]  Step: 52ms | Tot: 4s158ms | Loss: 0.580 | Acc: 81.850% (8185/10000) 100/100 
+
+Epoch: 51
+ [================================================================>]  Step: 85ms | Tot: 45s966ms | Loss: 0.295 | Acc: 89.964% (44982/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s123ms | Loss: 0.590 | Acc: 81.590% (8159/10000) 100/100 
+
+Epoch: 52
+ [================================================================>]  Step: 78ms | Tot: 46s431ms | Loss: 0.294 | Acc: 89.934% (44967/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s269ms | Loss: 0.486 | Acc: 84.350% (8435/10000) 100/100 
+
+Epoch: 53
+ [================================================================>]  Step: 86ms | Tot: 45s815ms | Loss: 0.293 | Acc: 89.936% (44968/50000) 391/391 
+ [================================================================>]  Step: 33ms | Tot: 4s555ms | Loss: 0.459 | Acc: 84.580% (8458/10000) 100/100 
+
+Epoch: 54
+ [================================================================>]  Step: 71ms | Tot: 45s696ms | Loss: 0.292 | Acc: 90.076% (45038/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s176ms | Loss: 0.462 | Acc: 85.150% (8515/10000) 100/100 
+
+Epoch: 55
+ [================================================================>]  Step: 80ms | Tot: 46s267ms | Loss: 0.288 | Acc: 90.136% (45068/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s89ms | Loss: 0.657 | Acc: 79.280% (7928/10000) 100/100 
+
+Epoch: 56
+ [================================================================>]  Step: 79ms | Tot: 46s129ms | Loss: 0.291 | Acc: 90.154% (45077/50000) 391/391 
+ [================================================================>]  Step: 26ms | Tot: 4s369ms | Loss: 0.460 | Acc: 84.970% (8497/10000) 100/100 
+
+Epoch: 57
+ [================================================================>]  Step: 80ms | Tot: 46s470ms | Loss: 0.283 | Acc: 90.352% (45176/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s157ms | Loss: 0.465 | Acc: 85.090% (8509/10000) 100/100 
+
+Epoch: 58
+ [================================================================>]  Step: 68ms | Tot: 46s63ms | Loss: 0.281 | Acc: 90.476% (45238/50000) 391/391 
+ [================================================================>]  Step: 43ms | Tot: 4s8ms | Loss: 0.568 | Acc: 82.740% (8274/10000) 100/100 
+
+Epoch: 59
+ [================================================================>]  Step: 83ms | Tot: 46s21ms | Loss: 0.283 | Acc: 90.256% (45128/50000) 391/391 
+ [================================================================>]  Step: 46ms | Tot: 4s59ms | Loss: 0.414 | Acc: 86.750% (8675/10000) 100/100 
+
+Epoch: 60
+ [================================================================>]  Step: 79ms | Tot: 46s82ms | Loss: 0.282 | Acc: 90.388% (45194/50000) 391/391 
+ [================================================================>]  Step: 50ms | Tot: 4s48ms | Loss: 0.502 | Acc: 83.380% (8338/10000) 100/100 
+
+Epoch: 61
+ [================================================================>]  Step: 78ms | Tot: 46s483ms | Loss: 0.279 | Acc: 90.516% (45258/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s198ms | Loss: 0.480 | Acc: 84.610% (8461/10000) 100/100 
+
+Epoch: 62
+ [================================================================>]  Step: 83ms | Tot: 46s237ms | Loss: 0.274 | Acc: 90.624% (45312/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s147ms | Loss: 0.443 | Acc: 85.170% (8517/10000) 100/100 
+
+Epoch: 63
+ [================================================================>]  Step: 72ms | Tot: 45s980ms | Loss: 0.274 | Acc: 90.688% (45344/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s77ms | Loss: 0.371 | Acc: 87.560% (8756/10000) 100/100 
+Saving..
+
+Epoch: 64
+ [================================================================>]  Step: 87ms | Tot: 46s117ms | Loss: 0.270 | Acc: 90.782% (45391/50000) 391/391 
+ [================================================================>]  Step: 49ms | Tot: 4s213ms | Loss: 0.417 | Acc: 86.070% (8607/10000) 100/100 
+
+Epoch: 65
+ [================================================================>]  Step: 76ms | Tot: 46s252ms | Loss: 0.270 | Acc: 90.736% (45368/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s916ms | Loss: 0.601 | Acc: 81.240% (8124/10000) 100/100 
+
+Epoch: 66
+ [================================================================>]  Step: 82ms | Tot: 45s793ms | Loss: 0.266 | Acc: 90.960% (45480/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s79ms | Loss: 0.433 | Acc: 85.970% (8597/10000) 100/100 
+
+Epoch: 67
+ [================================================================>]  Step: 73ms | Tot: 46s204ms | Loss: 0.264 | Acc: 91.090% (45545/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s298ms | Loss: 0.475 | Acc: 84.400% (8440/10000) 100/100 
+
+Epoch: 68
+ [================================================================>]  Step: 83ms | Tot: 46s404ms | Loss: 0.261 | Acc: 90.954% (45477/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s113ms | Loss: 0.354 | Acc: 88.750% (8875/10000) 100/100 
+Saving..
+
+Epoch: 69
+ [================================================================>]  Step: 75ms | Tot: 46s170ms | Loss: 0.264 | Acc: 90.948% (45474/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s956ms | Loss: 0.387 | Acc: 87.650% (8765/10000) 100/100 
+
+Epoch: 70
+ [================================================================>]  Step: 79ms | Tot: 46s268ms | Loss: 0.267 | Acc: 90.930% (45465/50000) 391/391 
+ [================================================================>]  Step: 47ms | Tot: 4s94ms | Loss: 0.352 | Acc: 88.190% (8819/10000) 100/100 
+
+Epoch: 71
+ [================================================================>]  Step: 79ms | Tot: 46s53ms | Loss: 0.255 | Acc: 91.268% (45634/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s94ms | Loss: 0.415 | Acc: 87.270% (8727/10000) 100/100 
+
+Epoch: 72
+ [================================================================>]  Step: 79ms | Tot: 46s216ms | Loss: 0.255 | Acc: 91.342% (45671/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s113ms | Loss: 0.396 | Acc: 87.250% (8725/10000) 100/100 
+
+Epoch: 73
+ [================================================================>]  Step: 85ms | Tot: 46s310ms | Loss: 0.254 | Acc: 91.430% (45715/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s300ms | Loss: 0.420 | Acc: 86.260% (8626/10000) 100/100 
+
+Epoch: 74
+ [================================================================>]  Step: 83ms | Tot: 46s577ms | Loss: 0.248 | Acc: 91.532% (45766/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s238ms | Loss: 0.374 | Acc: 87.770% (8777/10000) 100/100 
+
+Epoch: 75
+ [================================================================>]  Step: 86ms | Tot: 45s952ms | Loss: 0.251 | Acc: 91.386% (45693/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s149ms | Loss: 0.484 | Acc: 84.590% (8459/10000) 100/100 
+
+Epoch: 76
+ [================================================================>]  Step: 84ms | Tot: 46s74ms | Loss: 0.244 | Acc: 91.618% (45809/50000) 391/391 
+ [================================================================>]  Step: 30ms | Tot: 4s493ms | Loss: 0.435 | Acc: 85.760% (8576/10000) 100/100 
+
+Epoch: 77
+ [================================================================>]  Step: 75ms | Tot: 45s995ms | Loss: 0.243 | Acc: 91.586% (45793/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s229ms | Loss: 0.368 | Acc: 88.040% (8804/10000) 100/100 
+
+Epoch: 78
+ [================================================================>]  Step: 68ms | Tot: 46s442ms | Loss: 0.244 | Acc: 91.638% (45819/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s196ms | Loss: 0.416 | Acc: 86.270% (8627/10000) 100/100 
+
+Epoch: 79
+ [================================================================>]  Step: 78ms | Tot: 46s334ms | Loss: 0.239 | Acc: 91.828% (45914/50000) 391/391 
+ [================================================================>]  Step: 50ms | Tot: 4s165ms | Loss: 0.455 | Acc: 85.450% (8545/10000) 100/100 
+
+Epoch: 80
+ [================================================================>]  Step: 80ms | Tot: 46s214ms | Loss: 0.235 | Acc: 91.958% (45979/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s320ms | Loss: 0.369 | Acc: 88.000% (8800/10000) 100/100 
+
+Epoch: 81
+ [================================================================>]  Step: 80ms | Tot: 46s318ms | Loss: 0.240 | Acc: 91.764% (45882/50000) 391/391 
+ [================================================================>]  Step: 103ms | Tot: 4s281ms | Loss: 0.364 | Acc: 88.290% (8829/10000) 100/100 
+
+Epoch: 82
+ [================================================================>]  Step: 80ms | Tot: 46s223ms | Loss: 0.231 | Acc: 92.034% (46017/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s151ms | Loss: 0.387 | Acc: 87.430% (8743/10000) 100/100 
+
+Epoch: 83
+ [================================================================>]  Step: 85ms | Tot: 46s452ms | Loss: 0.229 | Acc: 92.144% (46072/50000) 391/391 
+ [================================================================>]  Step: 36ms | Tot: 4s73ms | Loss: 0.336 | Acc: 89.090% (8909/10000) 100/100 
+Saving..
+
+Epoch: 84
+ [================================================================>]  Step: 81ms | Tot: 46s367ms | Loss: 0.232 | Acc: 91.994% (45997/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s228ms | Loss: 0.376 | Acc: 87.740% (8774/10000) 100/100 
+
+Epoch: 85
+ [================================================================>]  Step: 85ms | Tot: 45s971ms | Loss: 0.225 | Acc: 92.414% (46207/50000) 391/391 
+ [================================================================>]  Step: 43ms | Tot: 4s259ms | Loss: 0.355 | Acc: 88.150% (8815/10000) 100/100 
+
+Epoch: 86
+ [================================================================>]  Step: 79ms | Tot: 46s88ms | Loss: 0.217 | Acc: 92.686% (46343/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s442ms | Loss: 0.420 | Acc: 86.750% (8675/10000) 100/100 
+
+Epoch: 87
+ [================================================================>]  Step: 82ms | Tot: 46s3ms | Loss: 0.219 | Acc: 92.540% (46270/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s139ms | Loss: 0.471 | Acc: 85.020% (8502/10000) 100/100 
+
+Epoch: 88
+ [================================================================>]  Step: 83ms | Tot: 46s100ms | Loss: 0.217 | Acc: 92.684% (46342/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s225ms | Loss: 0.326 | Acc: 88.840% (8884/10000) 100/100 
+
+Epoch: 89
+ [================================================================>]  Step: 81ms | Tot: 46s493ms | Loss: 0.220 | Acc: 92.556% (46278/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s182ms | Loss: 0.325 | Acc: 89.200% (8920/10000) 100/100 
+Saving..
+
+Epoch: 90
+ [================================================================>]  Step: 80ms | Tot: 45s931ms | Loss: 0.209 | Acc: 92.802% (46401/50000) 391/391 
+ [================================================================>]  Step: 36ms | Tot: 4s62ms | Loss: 0.375 | Acc: 87.720% (8772/10000) 100/100 
+
+Epoch: 91
+ [================================================================>]  Step: 80ms | Tot: 46s238ms | Loss: 0.211 | Acc: 92.770% (46385/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 4s87ms | Loss: 0.314 | Acc: 89.620% (8962/10000) 100/100 
+Saving..
+
+Epoch: 92
+ [================================================================>]  Step: 77ms | Tot: 46s48ms | Loss: 0.206 | Acc: 92.960% (46480/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s39ms | Loss: 0.350 | Acc: 88.570% (8857/10000) 100/100 
+
+Epoch: 93
+ [================================================================>]  Step: 83ms | Tot: 46s46ms | Loss: 0.208 | Acc: 92.982% (46491/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s278ms | Loss: 0.356 | Acc: 88.700% (8870/10000) 100/100 
+
+Epoch: 94
+ [================================================================>]  Step: 83ms | Tot: 45s983ms | Loss: 0.205 | Acc: 93.080% (46540/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 4s563ms | Loss: 0.356 | Acc: 88.330% (8833/10000) 100/100 
+
+Epoch: 95
+ [================================================================>]  Step: 72ms | Tot: 45s594ms | Loss: 0.203 | Acc: 93.046% (46523/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s109ms | Loss: 0.349 | Acc: 89.000% (8900/10000) 100/100 
+
+Epoch: 96
+ [================================================================>]  Step: 80ms | Tot: 46s282ms | Loss: 0.198 | Acc: 93.272% (46636/50000) 391/391 
+ [================================================================>]  Step: 55ms | Tot: 4s100ms | Loss: 0.433 | Acc: 85.760% (8576/10000) 100/100 
+
+Epoch: 97
+ [================================================================>]  Step: 83ms | Tot: 45s800ms | Loss: 0.198 | Acc: 93.160% (46580/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s134ms | Loss: 0.351 | Acc: 88.960% (8896/10000) 100/100 
+
+Epoch: 98
+ [================================================================>]  Step: 83ms | Tot: 46s16ms | Loss: 0.191 | Acc: 93.550% (46775/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s64ms | Loss: 0.402 | Acc: 87.210% (8721/10000) 100/100 
+
+Epoch: 99
+ [================================================================>]  Step: 78ms | Tot: 45s784ms | Loss: 0.193 | Acc: 93.348% (46674/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s244ms | Loss: 0.355 | Acc: 88.460% (8846/10000) 100/100 
+
+Epoch: 100
+ [================================================================>]  Step: 84ms | Tot: 46s244ms | Loss: 0.187 | Acc: 93.662% (46831/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s272ms | Loss: 0.343 | Acc: 89.260% (8926/10000) 100/100 
+
+Epoch: 101
+ [================================================================>]  Step: 78ms | Tot: 46s184ms | Loss: 0.190 | Acc: 93.526% (46763/50000) 391/391 
+ [================================================================>]  Step: 73ms | Tot: 4s94ms | Loss: 0.444 | Acc: 86.400% (8640/10000) 100/100 
+
+Epoch: 102
+ [================================================================>]  Step: 67ms | Tot: 46s120ms | Loss: 0.181 | Acc: 93.900% (46950/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s184ms | Loss: 0.343 | Acc: 88.840% (8884/10000) 100/100 
+
+Epoch: 103
+ [================================================================>]  Step: 80ms | Tot: 46s2ms | Loss: 0.184 | Acc: 93.692% (46846/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s755ms | Loss: 0.362 | Acc: 88.640% (8864/10000) 100/100 
+
+Epoch: 104
+ [================================================================>]  Step: 83ms | Tot: 45s779ms | Loss: 0.176 | Acc: 93.962% (46981/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s41ms | Loss: 0.314 | Acc: 89.840% (8984/10000) 100/100 
+Saving..
+
+Epoch: 105
+ [================================================================>]  Step: 78ms | Tot: 46s394ms | Loss: 0.171 | Acc: 94.206% (47103/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s37ms | Loss: 0.375 | Acc: 88.480% (8848/10000) 100/100 
+
+Epoch: 106
+ [================================================================>]  Step: 81ms | Tot: 46s351ms | Loss: 0.175 | Acc: 93.984% (46992/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s272ms | Loss: 0.351 | Acc: 89.050% (8905/10000) 100/100 
+
+Epoch: 107
+ [================================================================>]  Step: 82ms | Tot: 46s139ms | Loss: 0.168 | Acc: 94.226% (47113/50000) 391/391 
+ [================================================================>]  Step: 33ms | Tot: 4s108ms | Loss: 0.347 | Acc: 89.520% (8952/10000) 100/100 
+
+Epoch: 108
+ [================================================================>]  Step: 83ms | Tot: 46s108ms | Loss: 0.170 | Acc: 94.182% (47091/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s127ms | Loss: 0.326 | Acc: 89.670% (8967/10000) 100/100 
+
+Epoch: 109
+ [================================================================>]  Step: 82ms | Tot: 46s651ms | Loss: 0.164 | Acc: 94.470% (47235/50000) 391/391 
+ [================================================================>]  Step: 31ms | Tot: 4s213ms | Loss: 0.359 | Acc: 88.680% (8868/10000) 100/100 
+
+Epoch: 110
+ [================================================================>]  Step: 82ms | Tot: 45s929ms | Loss: 0.160 | Acc: 94.504% (47252/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s519ms | Loss: 0.332 | Acc: 89.520% (8952/10000) 100/100 
+
+Epoch: 111
+ [================================================================>]  Step: 73ms | Tot: 45s936ms | Loss: 0.156 | Acc: 94.688% (47344/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 5s126ms | Loss: 0.318 | Acc: 89.980% (8998/10000) 100/100 
+Saving..
+
+Epoch: 112
+ [================================================================>]  Step: 80ms | Tot: 46s300ms | Loss: 0.151 | Acc: 94.898% (47449/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s292ms | Loss: 0.297 | Acc: 90.990% (9099/10000) 100/100 
+Saving..
+
+Epoch: 113
+ [================================================================>]  Step: 81ms | Tot: 46s350ms | Loss: 0.155 | Acc: 94.732% (47366/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s127ms | Loss: 0.307 | Acc: 90.530% (9053/10000) 100/100 
+
+Epoch: 114
+ [================================================================>]  Step: 69ms | Tot: 46s427ms | Loss: 0.146 | Acc: 94.954% (47477/50000) 391/391 
+ [================================================================>]  Step: 36ms | Tot: 4s266ms | Loss: 0.315 | Acc: 90.240% (9024/10000) 100/100 
+
+Epoch: 115
+ [================================================================>]  Step: 86ms | Tot: 46s514ms | Loss: 0.145 | Acc: 95.172% (47586/50000) 391/391 
+ [================================================================>]  Step: 43ms | Tot: 4s230ms | Loss: 0.403 | Acc: 87.780% (8778/10000) 100/100 
+
+Epoch: 116
+ [================================================================>]  Step: 71ms | Tot: 46s388ms | Loss: 0.144 | Acc: 95.104% (47552/50000) 391/391 
+ [================================================================>]  Step: 59ms | Tot: 4s117ms | Loss: 0.349 | Acc: 89.230% (8923/10000) 100/100 
+
+Epoch: 117
+ [================================================================>]  Step: 80ms | Tot: 46s157ms | Loss: 0.141 | Acc: 95.162% (47581/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s291ms | Loss: 0.314 | Acc: 89.980% (8998/10000) 100/100 
+
+Epoch: 118
+ [================================================================>]  Step: 75ms | Tot: 46s643ms | Loss: 0.139 | Acc: 95.194% (47597/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s210ms | Loss: 0.264 | Acc: 91.340% (9134/10000) 100/100 
+Saving..
+
+Epoch: 119
+ [================================================================>]  Step: 79ms | Tot: 46s466ms | Loss: 0.128 | Acc: 95.678% (47839/50000) 391/391 
+ [================================================================>]  Step: 30ms | Tot: 4s241ms | Loss: 0.363 | Acc: 89.000% (8900/10000) 100/100 
+
+Epoch: 120
+ [================================================================>]  Step: 77ms | Tot: 46s251ms | Loss: 0.134 | Acc: 95.456% (47728/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 5s335ms | Loss: 0.297 | Acc: 90.730% (9073/10000) 100/100 
+
+Epoch: 121
+ [================================================================>]  Step: 72ms | Tot: 46s194ms | Loss: 0.127 | Acc: 95.748% (47874/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s319ms | Loss: 0.297 | Acc: 90.650% (9065/10000) 100/100 
+
+Epoch: 122
+ [================================================================>]  Step: 73ms | Tot: 46s424ms | Loss: 0.125 | Acc: 95.726% (47863/50000) 391/391 
+ [================================================================>]  Step: 29ms | Tot: 5s250ms | Loss: 0.327 | Acc: 89.740% (8974/10000) 100/100 
+
+Epoch: 123
+ [================================================================>]  Step: 80ms | Tot: 46s595ms | Loss: 0.121 | Acc: 95.814% (47907/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s336ms | Loss: 0.337 | Acc: 89.900% (8990/10000) 100/100 
+
+Epoch: 124
+ [================================================================>]  Step: 84ms | Tot: 45s970ms | Loss: 0.122 | Acc: 95.774% (47887/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s342ms | Loss: 0.331 | Acc: 89.850% (8985/10000) 100/100 
+
+Epoch: 125
+ [================================================================>]  Step: 70ms | Tot: 46s311ms | Loss: 0.118 | Acc: 95.966% (47983/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s346ms | Loss: 0.298 | Acc: 90.780% (9078/10000) 100/100 
+
+Epoch: 126
+ [================================================================>]  Step: 83ms | Tot: 46s490ms | Loss: 0.115 | Acc: 96.108% (48054/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s262ms | Loss: 0.301 | Acc: 90.890% (9089/10000) 100/100 
+
+Epoch: 127
+ [================================================================>]  Step: 86ms | Tot: 46s921ms | Loss: 0.111 | Acc: 96.286% (48143/50000) 391/391 
+ [================================================================>]  Step: 26ms | Tot: 4s457ms | Loss: 0.293 | Acc: 91.290% (9129/10000) 100/100 
+
+Epoch: 128
+ [================================================================>]  Step: 79ms | Tot: 46s2ms | Loss: 0.109 | Acc: 96.238% (48119/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s331ms | Loss: 0.277 | Acc: 91.510% (9151/10000) 100/100 
+Saving..
+
+Epoch: 129
+ [================================================================>]  Step: 74ms | Tot: 45s996ms | Loss: 0.098 | Acc: 96.668% (48334/50000) 391/391 
+ [================================================================>]  Step: 26ms | Tot: 5s18ms | Loss: 0.290 | Acc: 91.300% (9130/10000) 100/100 
+
+Epoch: 130
+ [================================================================>]  Step: 88ms | Tot: 46s402ms | Loss: 0.106 | Acc: 96.356% (48178/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s360ms | Loss: 0.330 | Acc: 90.460% (9046/10000) 100/100 
+
+Epoch: 131
+ [================================================================>]  Step: 84ms | Tot: 46s509ms | Loss: 0.101 | Acc: 96.598% (48299/50000) 391/391 
+ [================================================================>]  Step: 47ms | Tot: 4s171ms | Loss: 0.285 | Acc: 91.360% (9136/10000) 100/100 
+
+Epoch: 132
+ [================================================================>]  Step: 91ms | Tot: 46s240ms | Loss: 0.095 | Acc: 96.712% (48356/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 4s316ms | Loss: 0.306 | Acc: 90.730% (9073/10000) 100/100 
+
+Epoch: 133
+ [================================================================>]  Step: 82ms | Tot: 46s193ms | Loss: 0.093 | Acc: 96.922% (48461/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s341ms | Loss: 0.325 | Acc: 90.840% (9084/10000) 100/100 
+
+Epoch: 134
+ [================================================================>]  Step: 73ms | Tot: 46s434ms | Loss: 0.088 | Acc: 97.040% (48520/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s290ms | Loss: 0.269 | Acc: 91.740% (9174/10000) 100/100 
+Saving..
+
+Epoch: 135
+ [================================================================>]  Step: 72ms | Tot: 46s604ms | Loss: 0.087 | Acc: 97.034% (48517/50000) 391/391 
+ [================================================================>]  Step: 46ms | Tot: 4s197ms | Loss: 0.270 | Acc: 92.240% (9224/10000) 100/100 
+Saving..
+
+Epoch: 136
+ [================================================================>]  Step: 81ms | Tot: 46s513ms | Loss: 0.086 | Acc: 97.024% (48512/50000) 391/391 
+ [================================================================>]  Step: 50ms | Tot: 4s373ms | Loss: 0.272 | Acc: 91.480% (9148/10000) 100/100 
+
+Epoch: 137
+ [================================================================>]  Step: 83ms | Tot: 46s569ms | Loss: 0.086 | Acc: 97.016% (48508/50000) 391/391 
+ [================================================================>]  Step: 29ms | Tot: 4s302ms | Loss: 0.315 | Acc: 90.820% (9082/10000) 100/100 
+
+Epoch: 138
+ [================================================================>]  Step: 83ms | Tot: 46s363ms | Loss: 0.079 | Acc: 97.356% (48678/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s359ms | Loss: 0.267 | Acc: 92.200% (9220/10000) 100/100 
+
+Epoch: 139
+ [================================================================>]  Step: 79ms | Tot: 45s889ms | Loss: 0.073 | Acc: 97.544% (48772/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s759ms | Loss: 0.261 | Acc: 92.220% (9222/10000) 100/100 
+
+Epoch: 140
+ [================================================================>]  Step: 79ms | Tot: 46s308ms | Loss: 0.073 | Acc: 97.536% (48768/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s283ms | Loss: 0.269 | Acc: 91.820% (9182/10000) 100/100 
+
+Epoch: 141
+ [================================================================>]  Step: 70ms | Tot: 46s342ms | Loss: 0.069 | Acc: 97.676% (48838/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s357ms | Loss: 0.331 | Acc: 90.400% (9040/10000) 100/100 
+
+Epoch: 142
+ [================================================================>]  Step: 84ms | Tot: 46s482ms | Loss: 0.067 | Acc: 97.744% (48872/50000) 391/391 
+ [================================================================>]  Step: 31ms | Tot: 4s335ms | Loss: 0.358 | Acc: 90.300% (9030/10000) 100/100 
+
+Epoch: 143
+ [================================================================>]  Step: 88ms | Tot: 46s388ms | Loss: 0.067 | Acc: 97.734% (48867/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s332ms | Loss: 0.263 | Acc: 92.200% (9220/10000) 100/100 
+
+Epoch: 144
+ [================================================================>]  Step: 73ms | Tot: 46s259ms | Loss: 0.058 | Acc: 98.048% (49024/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s397ms | Loss: 0.251 | Acc: 92.780% (9278/10000) 100/100 
+Saving..
+
+Epoch: 145
+ [================================================================>]  Step: 69ms | Tot: 46s597ms | Loss: 0.060 | Acc: 98.010% (49005/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s306ms | Loss: 0.262 | Acc: 92.440% (9244/10000) 100/100 
+
+Epoch: 146
+ [================================================================>]  Step: 86ms | Tot: 46s378ms | Loss: 0.056 | Acc: 98.158% (49079/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s306ms | Loss: 0.281 | Acc: 92.440% (9244/10000) 100/100 
+
+Epoch: 147
+ [================================================================>]  Step: 88ms | Tot: 46s204ms | Loss: 0.049 | Acc: 98.390% (49195/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s357ms | Loss: 0.263 | Acc: 92.280% (9228/10000) 100/100 
+
+Epoch: 148
+ [================================================================>]  Step: 91ms | Tot: 45s892ms | Loss: 0.052 | Acc: 98.306% (49153/50000) 391/391 
+ [================================================================>]  Step: 51ms | Tot: 5s218ms | Loss: 0.277 | Acc: 92.250% (9225/10000) 100/100 
+
+Epoch: 149
+ [================================================================>]  Step: 84ms | Tot: 46s445ms | Loss: 0.050 | Acc: 98.276% (49138/50000) 391/391 
+ [================================================================>]  Step: 43ms | Tot: 4s309ms | Loss: 0.227 | Acc: 93.720% (9372/10000) 100/100 
+Saving..
+
+Epoch: 150
+ [================================================================>]  Step: 84ms | Tot: 46s280ms | Loss: 0.044 | Acc: 98.546% (49273/50000) 391/391 
+ [================================================================>]  Step: 33ms | Tot: 4s261ms | Loss: 0.254 | Acc: 93.140% (9314/10000) 100/100 
+
+Epoch: 151
+ [================================================================>]  Step: 78ms | Tot: 46s385ms | Loss: 0.042 | Acc: 98.610% (49305/50000) 391/391 
+ [================================================================>]  Step: 51ms | Tot: 4s401ms | Loss: 0.259 | Acc: 92.840% (9284/10000) 100/100 
+
+Epoch: 152
+ [================================================================>]  Step: 81ms | Tot: 46s605ms | Loss: 0.044 | Acc: 98.554% (49277/50000) 391/391 
+ [================================================================>]  Step: 52ms | Tot: 4s328ms | Loss: 0.259 | Acc: 92.860% (9286/10000) 100/100 
+
+Epoch: 153
+ [================================================================>]  Step: 73ms | Tot: 46s503ms | Loss: 0.039 | Acc: 98.782% (49391/50000) 391/391 
+ [================================================================>]  Step: 29ms | Tot: 4s340ms | Loss: 0.257 | Acc: 93.030% (9303/10000) 100/100 
+
+Epoch: 154
+ [================================================================>]  Step: 74ms | Tot: 47s71ms | Loss: 0.038 | Acc: 98.774% (49387/50000) 391/391 
+ [================================================================>]  Step: 31ms | Tot: 4s405ms | Loss: 0.231 | Acc: 93.780% (9378/10000) 100/100 
+Saving..
+
+Epoch: 155
+ [================================================================>]  Step: 73ms | Tot: 46s739ms | Loss: 0.028 | Acc: 99.104% (49552/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s369ms | Loss: 0.245 | Acc: 93.500% (9350/10000) 100/100 
+
+Epoch: 156
+ [================================================================>]  Step: 84ms | Tot: 46s543ms | Loss: 0.028 | Acc: 99.162% (49581/50000) 391/391 
+ [================================================================>]  Step: 33ms | Tot: 5s96ms | Loss: 0.248 | Acc: 93.520% (9352/10000) 100/100 
+
+Epoch: 157
+ [================================================================>]  Step: 85ms | Tot: 46s671ms | Loss: 0.029 | Acc: 99.088% (49544/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 4s471ms | Loss: 0.247 | Acc: 93.490% (9349/10000) 100/100 
+
+Epoch: 158
+ [================================================================>]  Step: 80ms | Tot: 47s53ms | Loss: 0.026 | Acc: 99.204% (49602/50000) 391/391 
+ [================================================================>]  Step: 55ms | Tot: 4s414ms | Loss: 0.242 | Acc: 93.480% (9348/10000) 100/100 
+
+Epoch: 159
+ [================================================================>]  Step: 75ms | Tot: 46s705ms | Loss: 0.022 | Acc: 99.322% (49661/50000) 391/391 
+ [================================================================>]  Step: 36ms | Tot: 4s432ms | Loss: 0.238 | Acc: 93.830% (9383/10000) 100/100 
+Saving..
+
+Epoch: 160
+ [================================================================>]  Step: 81ms | Tot: 46s454ms | Loss: 0.017 | Acc: 99.500% (49750/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s399ms | Loss: 0.241 | Acc: 93.710% (9371/10000) 100/100 
+
+Epoch: 161
+ [================================================================>]  Step: 79ms | Tot: 46s705ms | Loss: 0.018 | Acc: 99.444% (49722/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s404ms | Loss: 0.232 | Acc: 93.860% (9386/10000) 100/100 
+Saving..
+
+Epoch: 162
+ [================================================================>]  Step: 84ms | Tot: 46s792ms | Loss: 0.017 | Acc: 99.516% (49758/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s642ms | Loss: 0.217 | Acc: 94.110% (9411/10000) 100/100 
+Saving..
+
+Epoch: 163
+ [================================================================>]  Step: 92ms | Tot: 46s500ms | Loss: 0.013 | Acc: 99.644% (49822/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s322ms | Loss: 0.232 | Acc: 94.110% (9411/10000) 100/100 
+
+Epoch: 164
+ [================================================================>]  Step: 82ms | Tot: 46s595ms | Loss: 0.011 | Acc: 99.696% (49848/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s441ms | Loss: 0.219 | Acc: 94.510% (9451/10000) 100/100 
+Saving..
+
+Epoch: 165
+ [================================================================>]  Step: 86ms | Tot: 46s256ms | Loss: 0.010 | Acc: 99.736% (49868/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s574ms | Loss: 0.210 | Acc: 94.600% (9460/10000) 100/100 
+Saving..
+
+Epoch: 166
+ [================================================================>]  Step: 78ms | Tot: 46s525ms | Loss: 0.008 | Acc: 99.820% (49910/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s660ms | Loss: 0.201 | Acc: 94.710% (9471/10000) 100/100 
+Saving..
+
+Epoch: 167
+ [================================================================>]  Step: 87ms | Tot: 46s868ms | Loss: 0.006 | Acc: 99.864% (49932/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s771ms | Loss: 0.203 | Acc: 94.760% (9476/10000) 100/100 
+Saving..
+
+Epoch: 168
+ [================================================================>]  Step: 76ms | Tot: 46s552ms | Loss: 0.006 | Acc: 99.862% (49931/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s383ms | Loss: 0.210 | Acc: 94.610% (9461/10000) 100/100 
+
+Epoch: 169
+ [================================================================>]  Step: 88ms | Tot: 46s596ms | Loss: 0.006 | Acc: 99.902% (49951/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s469ms | Loss: 0.199 | Acc: 95.080% (9508/10000) 100/100 
+Saving..
+
+Epoch: 170
+ [================================================================>]  Step: 84ms | Tot: 46s580ms | Loss: 0.004 | Acc: 99.918% (49959/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s502ms | Loss: 0.194 | Acc: 95.060% (9506/10000) 100/100 
+
+Epoch: 171
+ [================================================================>]  Step: 67ms | Tot: 47s148ms | Loss: 0.004 | Acc: 99.934% (49967/50000) 391/391 
+ [================================================================>]  Step: 47ms | Tot: 4s467ms | Loss: 0.190 | Acc: 95.100% (9510/10000) 100/100 
+Saving..
+
+Epoch: 172
+ [================================================================>]  Step: 68ms | Tot: 46s640ms | Loss: 0.003 | Acc: 99.970% (49985/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s451ms | Loss: 0.192 | Acc: 95.090% (9509/10000) 100/100 
+
+Epoch: 173
+ [================================================================>]  Step: 74ms | Tot: 47s26ms | Loss: 0.002 | Acc: 99.988% (49994/50000) 391/391 
+ [================================================================>]  Step: 43ms | Tot: 4s549ms | Loss: 0.180 | Acc: 95.370% (9537/10000) 100/100 
+Saving..
+
+Epoch: 174
+ [================================================================>]  Step: 88ms | Tot: 46s690ms | Loss: 0.002 | Acc: 99.980% (49990/50000) 391/391 
+ [================================================================>]  Step: 48ms | Tot: 4s475ms | Loss: 0.177 | Acc: 95.350% (9535/10000) 100/100 
+
+Epoch: 175
+ [================================================================>]  Step: 78ms | Tot: 46s606ms | Loss: 0.003 | Acc: 99.972% (49986/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 4s916ms | Loss: 0.178 | Acc: 95.550% (9555/10000) 100/100 
+Saving..
+
+Epoch: 176
+ [================================================================>]  Step: 80ms | Tot: 46s688ms | Loss: 0.002 | Acc: 99.992% (49996/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s502ms | Loss: 0.176 | Acc: 95.470% (9547/10000) 100/100 
+
+Epoch: 177
+ [================================================================>]  Step: 80ms | Tot: 46s671ms | Loss: 0.002 | Acc: 99.988% (49994/50000) 391/391 
+ [================================================================>]  Step: 51ms | Tot: 4s495ms | Loss: 0.175 | Acc: 95.480% (9548/10000) 100/100 
+
+Epoch: 178
+ [================================================================>]  Step: 84ms | Tot: 46s597ms | Loss: 0.002 | Acc: 99.988% (49994/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s902ms | Loss: 0.175 | Acc: 95.580% (9558/10000) 100/100 
+Saving..
+
+Epoch: 179
+ [================================================================>]  Step: 73ms | Tot: 46s634ms | Loss: 0.002 | Acc: 99.994% (49997/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s377ms | Loss: 0.174 | Acc: 95.470% (9547/10000) 100/100 
+
+Epoch: 180
+ [================================================================>]  Step: 73ms | Tot: 47s110ms | Loss: 0.002 | Acc: 99.984% (49992/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s522ms | Loss: 0.176 | Acc: 95.500% (9550/10000) 100/100 
+
+Epoch: 181
+ [================================================================>]  Step: 82ms | Tot: 46s827ms | Loss: 0.002 | Acc: 99.988% (49994/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s412ms | Loss: 0.176 | Acc: 95.510% (9551/10000) 100/100 
+
+Epoch: 182
+ [================================================================>]  Step: 86ms | Tot: 46s659ms | Loss: 0.002 | Acc: 99.984% (49992/50000) 391/391 
+ [================================================================>]  Step: 36ms | Tot: 4s386ms | Loss: 0.174 | Acc: 95.540% (9554/10000) 100/100 
+
+Epoch: 183
+ [================================================================>]  Step: 79ms | Tot: 46s600ms | Loss: 0.002 | Acc: 99.984% (49992/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s469ms | Loss: 0.173 | Acc: 95.510% (9551/10000) 100/100 
+
+Epoch: 184
+ [================================================================>]  Step: 78ms | Tot: 46s839ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s481ms | Loss: 0.173 | Acc: 95.660% (9566/10000) 100/100 
+Saving..
+
+Epoch: 185
+ [================================================================>]  Step: 69ms | Tot: 46s668ms | Loss: 0.002 | Acc: 99.986% (49993/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s387ms | Loss: 0.169 | Acc: 95.630% (9563/10000) 100/100 
+
+Epoch: 186
+ [================================================================>]  Step: 73ms | Tot: 46s502ms | Loss: 0.002 | Acc: 99.996% (49998/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s480ms | Loss: 0.168 | Acc: 95.800% (9580/10000) 100/100 
+Saving..
+
+Epoch: 187
+ [================================================================>]  Step: 73ms | Tot: 46s337ms | Loss: 0.002 | Acc: 99.994% (49997/50000) 391/391 
+ [================================================================>]  Step: 47ms | Tot: 4s390ms | Loss: 0.171 | Acc: 95.690% (9569/10000) 100/100 
+
+Epoch: 188
+ [================================================================>]  Step: 69ms | Tot: 46s619ms | Loss: 0.002 | Acc: 99.982% (49991/50000) 391/391 
+ [================================================================>]  Step: 36ms | Tot: 5s211ms | Loss: 0.171 | Acc: 95.630% (9563/10000) 100/100 
+
+Epoch: 189
+ [================================================================>]  Step: 78ms | Tot: 46s471ms | Loss: 0.002 | Acc: 99.990% (49995/50000) 391/391 
+ [================================================================>]  Step: 27ms | Tot: 4s485ms | Loss: 0.171 | Acc: 95.550% (9555/10000) 100/100 
+
+Epoch: 190
+ [================================================================>]  Step: 79ms | Tot: 46s716ms | Loss: 0.002 | Acc: 99.992% (49996/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s474ms | Loss: 0.172 | Acc: 95.560% (9556/10000) 100/100 
+
+Epoch: 191
+ [================================================================>]  Step: 81ms | Tot: 46s898ms | Loss: 0.002 | Acc: 99.994% (49997/50000) 391/391 
+ [================================================================>]  Step: 36ms | Tot: 4s568ms | Loss: 0.170 | Acc: 95.640% (9564/10000) 100/100 
+
+Epoch: 192
+ [================================================================>]  Step: 81ms | Tot: 46s919ms | Loss: 0.002 | Acc: 99.996% (49998/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s495ms | Loss: 0.170 | Acc: 95.590% (9559/10000) 100/100 
+
+Epoch: 193
+ [================================================================>]  Step: 86ms | Tot: 46s863ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 27ms | Tot: 4s464ms | Loss: 0.170 | Acc: 95.680% (9568/10000) 100/100 
+
+Epoch: 194
+ [================================================================>]  Step: 95ms | Tot: 46s622ms | Loss: 0.002 | Acc: 100.000% (50000/50000) 391/391 
+ [================================================================>]  Step: 25ms | Tot: 4s524ms | Loss: 0.169 | Acc: 95.670% (9567/10000) 100/100 
+
+Epoch: 195
+ [================================================================>]  Step: 82ms | Tot: 46s694ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s384ms | Loss: 0.170 | Acc: 95.680% (9568/10000) 100/100 
+
+Epoch: 196
+ [================================================================>]  Step: 90ms | Tot: 46s249ms | Loss: 0.002 | Acc: 99.992% (49996/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s373ms | Loss: 0.169 | Acc: 95.720% (9572/10000) 100/100 
+
+Epoch: 197
+ [================================================================>]  Step: 82ms | Tot: 47s218ms | Loss: 0.002 | Acc: 99.988% (49994/50000) 391/391 
+ [================================================================>]  Step: 53ms | Tot: 4s594ms | Loss: 0.170 | Acc: 95.650% (9565/10000) 100/100 
+
+Epoch: 198
+ [================================================================>]  Step: 80ms | Tot: 46s690ms | Loss: 0.002 | Acc: 99.992% (49996/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s545ms | Loss: 0.170 | Acc: 95.700% (9570/10000) 100/100 
+
+Epoch: 199
+ [================================================================>]  Step: 76ms | Tot: 46s437ms | Loss: 0.002 | Acc: 99.990% (49995/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 5s96ms | Loss: 0.170 | Acc: 95.690% (9569/10000) 100/100 
+
+Epoch: 200
+ [================================================================>]  Step: 83ms | Tot: 46s584ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s516ms | Loss: 0.169 | Acc: 95.700% (9570/10000) 100/100 
+
+Epoch: 201
+ [================================================================>]  Step: 70ms | Tot: 46s971ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s586ms | Loss: 0.171 | Acc: 95.730% (9573/10000) 100/100 
+
+Epoch: 202
+ [================================================================>]  Step: 74ms | Tot: 47s7ms | Loss: 0.002 | Acc: 99.996% (49998/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s454ms | Loss: 0.169 | Acc: 95.650% (9565/10000) 100/100 
+
+Epoch: 203
+ [================================================================>]  Step: 91ms | Tot: 46s722ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s486ms | Loss: 0.170 | Acc: 95.730% (9573/10000) 100/100 
+
+Epoch: 204
+ [================================================================>]  Step: 88ms | Tot: 46s920ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s486ms | Loss: 0.169 | Acc: 95.700% (9570/10000) 100/100 
+
+Epoch: 205
+ [================================================================>]  Step: 80ms | Tot: 46s804ms | Loss: 0.002 | Acc: 99.990% (49995/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s532ms | Loss: 0.170 | Acc: 95.690% (9569/10000) 100/100 
+
+Epoch: 206
+ [================================================================>]  Step: 78ms | Tot: 46s907ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s420ms | Loss: 0.170 | Acc: 95.710% (9571/10000) 100/100 
+
+Epoch: 207
+ [================================================================>]  Step: 87ms | Tot: 46s939ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 4s531ms | Loss: 0.170 | Acc: 95.780% (9578/10000) 100/100 
+
+Epoch: 208
+ [================================================================>]  Step: 99ms | Tot: 47s205ms | Loss: 0.002 | Acc: 100.000% (50000/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 4s643ms | Loss: 0.170 | Acc: 95.640% (9564/10000) 100/100 
+
+Epoch: 209
+ [================================================================>]  Step: 88ms | Tot: 47s360ms | Loss: 0.002 | Acc: 99.994% (49997/50000) 391/391 
+ [================================================================>]  Step: 80ms | Tot: 4s400ms | Loss: 0.171 | Acc: 95.640% (9564/10000) 100/100 
+
+Epoch: 210
+ [================================================================>]  Step: 78ms | Tot: 47s181ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 40ms | Tot: 4s473ms | Loss: 0.169 | Acc: 95.710% (9571/10000) 100/100 
+
+Epoch: 211
+ [================================================================>]  Step: 77ms | Tot: 46s342ms | Loss: 0.002 | Acc: 99.994% (49997/50000) 391/391 
+ [================================================================>]  Step: 26ms | Tot: 5s92ms | Loss: 0.169 | Acc: 95.610% (9561/10000) 100/100 
+
+Epoch: 212
+ [================================================================>]  Step: 67ms | Tot: 46s753ms | Loss: 0.002 | Acc: 99.996% (49998/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s564ms | Loss: 0.170 | Acc: 95.640% (9564/10000) 100/100 
+
+Epoch: 213
+ [================================================================>]  Step: 84ms | Tot: 46s830ms | Loss: 0.002 | Acc: 99.996% (49998/50000) 391/391 
+ [================================================================>]  Step: 53ms | Tot: 4s630ms | Loss: 0.171 | Acc: 95.650% (9565/10000) 100/100 
+
+Epoch: 214
+ [================================================================>]  Step: 88ms | Tot: 47s512ms | Loss: 0.002 | Acc: 99.990% (49995/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s500ms | Loss: 0.169 | Acc: 95.530% (9553/10000) 100/100 
+
+Epoch: 215
+ [================================================================>]  Step: 84ms | Tot: 47s157ms | Loss: 0.002 | Acc: 99.992% (49996/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s580ms | Loss: 0.169 | Acc: 95.510% (9551/10000) 100/100 
+
+Epoch: 216
+ [================================================================>]  Step: 67ms | Tot: 46s948ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 31ms | Tot: 4s526ms | Loss: 0.166 | Acc: 95.660% (9566/10000) 100/100 
+
+Epoch: 217
+ [================================================================>]  Step: 96ms | Tot: 46s930ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 29ms | Tot: 4s528ms | Loss: 0.168 | Acc: 95.530% (9553/10000) 100/100 
+
+Epoch: 218
+ [================================================================>]  Step: 89ms | Tot: 46s874ms | Loss: 0.002 | Acc: 100.000% (50000/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s513ms | Loss: 0.166 | Acc: 95.680% (9568/10000) 100/100 
+
+Epoch: 219
+ [================================================================>]  Step: 74ms | Tot: 47s159ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 46ms | Tot: 4s550ms | Loss: 0.169 | Acc: 95.590% (9559/10000) 100/100 
+
+Epoch: 220
+ [================================================================>]  Step: 74ms | Tot: 47s67ms | Loss: 0.002 | Acc: 99.992% (49996/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s588ms | Loss: 0.171 | Acc: 95.520% (9552/10000) 100/100 
+
+Epoch: 221
+ [================================================================>]  Step: 77ms | Tot: 46s683ms | Loss: 0.002 | Acc: 99.992% (49996/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 4s647ms | Loss: 0.169 | Acc: 95.540% (9554/10000) 100/100 
+
+Epoch: 222
+ [================================================================>]  Step: 75ms | Tot: 47s410ms | Loss: 0.002 | Acc: 100.000% (50000/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s604ms | Loss: 0.168 | Acc: 95.700% (9570/10000) 100/100 
+
+Epoch: 223
+ [================================================================>]  Step: 87ms | Tot: 46s817ms | Loss: 0.002 | Acc: 99.986% (49993/50000) 391/391 
+ [================================================================>]  Step: 25ms | Tot: 4s478ms | Loss: 0.169 | Acc: 95.630% (9563/10000) 100/100 
+
+Epoch: 224
+ [================================================================>]  Step: 78ms | Tot: 46s881ms | Loss: 0.002 | Acc: 99.996% (49998/50000) 391/391 
+ [================================================================>]  Step: 33ms | Tot: 4s483ms | Loss: 0.170 | Acc: 95.700% (9570/10000) 100/100 
+
+Epoch: 225
+ [================================================================>]  Step: 70ms | Tot: 46s213ms | Loss: 0.002 | Acc: 99.996% (49998/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 5s88ms | Loss: 0.171 | Acc: 95.620% (9562/10000) 100/100 
+
+Epoch: 226
+ [================================================================>]  Step: 76ms | Tot: 46s690ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 30ms | Tot: 4s524ms | Loss: 0.174 | Acc: 95.610% (9561/10000) 100/100 
+
+Epoch: 227
+ [================================================================>]  Step: 80ms | Tot: 46s849ms | Loss: 0.002 | Acc: 99.998% (49999/50000) 391/391 
+ [================================================================>]  Step: 38ms | Tot: 4s465ms | Loss: 0.173 | Acc: 95.490% (9549/10000) 100/100 
+
+Epoch: 228
+ [================================================================>]  Step: 76ms | Tot: 46s959ms | Loss: 0.002 | Acc: 99.988% (49994/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s488ms | Loss: 0.173 | Acc: 95.580% (9558/10000) 100/100 
+
+Epoch: 229
+ [================================================================>]  Step: 79ms | Tot: 47s27ms | Loss: 0.004 | Acc: 99.950% (49975/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s447ms | Loss: 0.190 | Acc: 95.160% (9516/10000) 100/100 
+
+Epoch: 230
+ [================================================================>]  Step: 70ms | Tot: 46s683ms | Loss: 0.004 | Acc: 99.954% (49977/50000) 391/391 
+ [================================================================>]  Step: 30ms | Tot: 4s485ms | Loss: 0.196 | Acc: 94.960% (9496/10000) 100/100 
+
+Epoch: 231
+ [================================================================>]  Step: 86ms | Tot: 47s41ms | Loss: 0.006 | Acc: 99.886% (49943/50000) 391/391 
+ [================================================================>]  Step: 35ms | Tot: 4s498ms | Loss: 0.244 | Acc: 93.500% (9350/10000) 100/100 
+
+Epoch: 232
+ [================================================================>]  Step: 79ms | Tot: 46s952ms | Loss: 0.030 | Acc: 99.082% (49541/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s535ms | Loss: 0.280 | Acc: 92.530% (9253/10000) 100/100 
+
+Epoch: 233
+ [================================================================>]  Step: 75ms | Tot: 46s785ms | Loss: 0.042 | Acc: 98.720% (49360/50000) 391/391 
+ [================================================================>]  Step: 41ms | Tot: 4s408ms | Loss: 0.279 | Acc: 92.840% (9284/10000) 100/100 
+
+Epoch: 234
+ [================================================================>]  Step: 76ms | Tot: 46s819ms | Loss: 0.051 | Acc: 98.408% (49204/50000) 391/391 
+ [================================================================>]  Step: 50ms | Tot: 4s549ms | Loss: 0.284 | Acc: 92.220% (9222/10000) 100/100 
+
+Epoch: 235
+ [================================================================>]  Step: 74ms | Tot: 46s766ms | Loss: 0.060 | Acc: 98.032% (49016/50000) 391/391 
+ [================================================================>]  Step: 36ms | Tot: 4s468ms | Loss: 0.282 | Acc: 92.040% (9204/10000) 100/100 
+
+Epoch: 236
+ [================================================================>]  Step: 94ms | Tot: 46s628ms | Loss: 0.064 | Acc: 97.972% (48986/50000) 391/391 
+ [================================================================>]  Step: 39ms | Tot: 4s502ms | Loss: 0.277 | Acc: 92.130% (9213/10000) 100/100 
+
+Epoch: 237
+ [================================================================>]  Step: 86ms | Tot: 46s797ms | Loss: 0.067 | Acc: 97.826% (48913/50000) 391/391 
+ [================================================================>]  Step: 26ms | Tot: 4s520ms | Loss: 0.327 | Acc: 90.890% (9089/10000) 100/100 
+
+Epoch: 238
+ [================================================================>]  Step: 72ms | Tot: 46s503ms | Loss: 0.071 | Acc: 97.640% (48820/50000) 391/391 
+ [================================================================>]  Step: 34ms | Tot: 5s138ms | Loss: 0.285 | Acc: 91.630% (9163/10000) 100/100 
+
+Epoch: 239
+ [================================================================>]  Step: 76ms | Tot: 46s585ms | Loss: 0.073 | Acc: 97.590% (48795/50000) 391/391 
+ [================================================================>]  Step: 42ms | Tot: 4s437ms | Loss: 0.302 | Acc: 91.640% (9164/10000) 100/100 
+
+Epoch: 240
+ [================================================================>]  Step: 84ms | Tot: 47s159ms | Loss: 0.075 | Acc: 97.554% (48777/50000) 391/391 
+ [================================================================>]  Step: 45ms | Tot: 4s626ms | Loss: 0.293 | Acc: 91.510% (9151/10000) 100/100 
+
+Epoch: 241
+ [================================================================>]  Step: 78ms | Tot: 46s746ms | Loss: 0.077 | Acc: 97.494% (48747/50000) 391/391 
+ [================================================================>]  Step: 37ms | Tot: 4s480ms | Loss: 0.311 | Acc: 90.900% (9090/10000) 100/100 
+
+Epoch: 242
+ [================================================================>]  Step: 67ms | Tot: 46s348ms | Loss: 0.073 | Acc: 97.620% (48810/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s534ms | Loss: 0.276 | Acc: 91.930% (9193/10000) 100/100 
+
+Epoch: 243
+ [================================================================>]  Step: 81ms | Tot: 47s41ms | Loss: 0.077 | Acc: 97.440% (48720/50000) 391/391 
+ [================================================================>]  Step: 32ms | Tot: 4s652ms | Loss: 0.363 | Acc: 89.980% (8998/10000) 100/100 
+
+Epoch: 244
+ [================================================================>]  Step: 89ms | Tot: 47s153ms | Loss: 0.080 | Acc: 97.266% (48633/50000) 391/391 
+ [================================================================>]  Step: 43ms | Tot: 4s362ms | Loss: 0.311 | Acc: 91.150% (9115/10000) 100/100 
+
+Epoch: 245
+ [================================================================>]  Step: 81ms | Tot: 46s875ms | Loss: 0.082 | Acc: 97.312% (48656/50000) 391/391 
+ [================================================================>]  Step: 26ms | Tot: 4s562ms | Loss: 0.283 | Acc: 91.610% (9161/10000) 100/100 
+
+Epoch: 246
+ [================================================================>]  Step: 87ms | Tot: 47s105ms | Loss: 0.086 | Acc: 97.106% (48553/50000) 391/391 
+ [================================================================>]  Step: 26ms | Tot: 4s521ms | Loss: 0.335 | Acc: 90.260% (9026/10000) 100/100 
+
+Epoch: 247
+ [================================================================>]  Step: 75ms | Tot: 47s280ms | Loss: 0.080 | Acc: 97.284% (48642/50000) 391/391 
+ [================================================================>]  Step: 44ms | Tot: 4s520ms | Loss: 0.288 | Acc: 91.660% (9166/10000) 100/100 
+
+Epoch: 248
+ [================================================================>]  Step: 77ms | Tot: 47s334ms | Loss: 0.078 | Acc: 97.418% (48709/50000) 391/391 
+ [================================================================>]  Step: 54ms | Tot: 4s447ms | Loss: 0.304 | Acc: 91.510% (9151/10000) 100/100 
+
+Epoch: 249
+ [================================================================>]  Step: 81ms | Tot: 46s803ms | Loss: 0.089 | Acc: 96.984% (48492/50000) 391/391 
+ [================================================================>]  Step: 52ms | Tot: 4s460ms | Loss: 0.290 | Acc: 91.470% (9147/10000) 100/100 
